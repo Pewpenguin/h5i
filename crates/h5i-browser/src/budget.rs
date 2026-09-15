@@ -31,6 +31,8 @@ pub struct Limits {
     /// still load for two minutes; the engine then has no answer except
     /// [`HardStop`], which is not an answer at all because it discards the page
     /// instead of reporting it unfinished.
+    ///
+    /// Checked for [`Spender::Page`] alone. See there for why.
     #[serde(with = "millis", default = "default_max_load_time")]
     pub max_load_time: Duration,
 }
@@ -87,6 +89,45 @@ impl Default for Budget {
     }
 }
 
+/// Whose request this is, which decides whether the load clock applies.
+///
+/// The ceilings bound untrusted page code. A replay is the principal driving
+/// the engine, and [`Limits::max_load_time`] measures wall clock since the last
+/// navigation whether anything was spent or not, so charging a replay for it
+/// refused the request an agent had just named because the agent spent a minute
+/// reading the previous answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spender {
+    /// The document and everything it caused: subresources, frames, redirects.
+    Page,
+    /// The agent, naming a request of its own.
+    Agent,
+}
+
+impl From<crate::receipt::Initiator> for Spender {
+    fn from(initiator: crate::receipt::Initiator) -> Self {
+        match initiator {
+            crate::receipt::Initiator::Replay => Spender::Agent,
+            _ => Spender::Page,
+        }
+    }
+}
+
+/// How to get the allowance back, which is not the same answer for both.
+///
+/// Navigating is how a *page* gets a fresh one. An agent partway through a walk
+/// has every reason not to: it would throw away the page state the walk stands
+/// on, and spend two more requests getting back to it.
+fn start_again(who: Spender) -> &'static str {
+    match who {
+        Spender::Page => "Navigating gives the page a fresh allowance.",
+        Spender::Agent => {
+            "`--reset-budget` starts the allowance again without leaving the page \
+             (`\"reset_budget\": true` over rpc)."
+        }
+    }
+}
+
 /// Why a request was refused, in the form a receipt records and a page reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exceeded(pub String);
@@ -140,16 +181,18 @@ impl Budget {
     /// here. A request that is about to be attempted has been spent, whatever
     /// its outcome, or a page whose every fetch fails would have an unlimited
     /// number of them.
-    pub fn claim_request(&self) -> Result<(), Exceeded> {
+    pub fn claim_request(&self, who: Spender) -> Result<(), Exceeded> {
         let spent = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         if spent > self.limits.max_requests {
             return Err(Exceeded(format!(
                 "budget-exceeded: this page has made {} requests, and the limit for one \
-                 navigation is {}. Navigating gives the page a fresh allowance.",
-                spent, self.limits.max_requests
+                 navigation is {}. {}",
+                spent,
+                self.limits.max_requests,
+                start_again(who)
             )));
         }
-        self.check_totals()
+        self.check_totals(who)
     }
 
     /// Record what a completed request cost.
@@ -166,29 +209,31 @@ impl Budget {
     /// refused at: a socket or an event stream carries bytes for as long as it
     /// is open, so it asks directly, per frame. See
     /// [`crate::net::LocalBroker::record_socket_frame`].
-    pub fn within_totals(&self) -> Result<(), Exceeded> {
-        self.check_totals()
+    pub fn within_totals(&self, who: Spender) -> Result<(), Exceeded> {
+        self.check_totals(who)
     }
 
     /// Separate from [`Self::claim_request`] so the byte and time totals are
     /// checked on the way *in* to the next request rather than the way out of
     /// the last one: the request that goes over the line should be the one
     /// refused, and refusing the one after it is both later and clearer.
-    fn check_totals(&self) -> Result<(), Exceeded> {
+    fn check_totals(&self, who: Spender) -> Result<(), Exceeded> {
         let wire = self.wire_bytes.load(Ordering::Relaxed);
         if wire > self.limits.max_wire_bytes {
             return Err(Exceeded(format!(
                 "budget-exceeded: this page has pulled {wire} bytes across the wire, and the \
-                 limit for one navigation is {}.",
-                self.limits.max_wire_bytes
+                 limit for one navigation is {}. {}",
+                self.limits.max_wire_bytes,
+                start_again(who)
             )));
         }
         let decoded = self.decoded_bytes.load(Ordering::Relaxed);
         if decoded > self.limits.max_decoded_bytes {
             return Err(Exceeded(format!(
                 "budget-exceeded: this page has decoded {decoded} bytes, and the limit for \
-                 one navigation is {}.",
-                self.limits.max_decoded_bytes
+                 one navigation is {}. {}",
+                self.limits.max_decoded_bytes,
+                start_again(who)
             )));
         }
         let micros = self.network_micros.load(Ordering::Relaxed);
@@ -196,22 +241,29 @@ impl Budget {
         if micros > limit {
             return Err(Exceeded(format!(
                 "budget-exceeded: this page has spent {}ms waiting on the network, and the \
-                 limit for one navigation is {}ms.",
+                 limit for one navigation is {}ms. {}",
                 micros / 1000,
-                limit / 1000
+                limit / 1000,
+                start_again(who)
             )));
         }
         // Last, because it is the least specific: when a page is over two
         // ceilings the one naming what it spent is the more useful answer.
-        let loading = self.loading();
-        if loading > self.limits.max_load_time {
-            return Err(Exceeded(format!(
-                "budget-exceeded: this page has been loading for {}s, and the limit for one \
-                 navigation is {}s. What it has rendered by now is what there is; navigating \
-                 gives the page a fresh allowance.",
-                loading.as_secs(),
-                self.limits.max_load_time.as_secs()
-            )));
+        //
+        // And only for the page. The ceilings above measure what the caller
+        // spent; this one measures how long ago the page was navigated to,
+        // which for a replay is how long the agent spent reading.
+        if who == Spender::Page {
+            let loading = self.loading();
+            if loading > self.limits.max_load_time {
+                return Err(Exceeded(format!(
+                    "budget-exceeded: this page has been loading for {}s, and the limit for one \
+                     navigation is {}s. What it has rendered by now is what there is. {}",
+                    loading.as_secs(),
+                    self.limits.max_load_time.as_secs(),
+                    start_again(who)
+                )));
+            }
         }
         Ok(())
     }
@@ -391,10 +443,10 @@ mod tests {
             max_load_time: Duration::from_millis(40),
             ..Limits::default()
         });
-        assert!(budget.claim_request().is_ok(), "inside the clock");
+        assert!(budget.claim_request(Spender::Page).is_ok(), "inside the clock");
         std::thread::sleep(Duration::from_millis(60));
         let refused = budget
-            .claim_request()
+            .claim_request(Spender::Page)
             .expect_err("past the clock, whatever else it spent");
         assert!(
             refused.to_string().contains("has been loading for"),
@@ -404,26 +456,139 @@ mod tests {
             refused.to_string().contains("what there is"),
             "and says the page is unfinished rather than broken: {refused}"
         );
+        assert!(
+            refused.to_string().ends_with(start_again(Spender::Page)),
+            "and how to get the allowance back: {refused}"
+        );
 
         // A navigation is a fresh decision by the principal, so it gets a
         // fresh clock along with everything else.
         budget.reset();
-        assert!(budget.claim_request().is_ok(), "navigating starts it again");
+        assert!(budget.claim_request(Spender::Page).is_ok(), "navigating starts it again");
+    }
+
+    /// The clock measures time since the last navigation, spent or not, so an
+    /// agent that read the previous answer for a minute found every replay
+    /// refused for a page that was not loading. Issue: `websec replay` against
+    /// a session older than 45s always failed.
+    #[test]
+    fn the_load_clock_bounds_the_page_and_not_the_agent() {
+        let budget = Budget::new(Limits {
+            max_load_time: Duration::from_millis(40),
+            ..Limits::default()
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            budget.claim_request(Spender::Page).is_err(),
+            "the page is past the clock"
+        );
+        assert!(
+            budget.claim_request(Spender::Agent).is_ok(),
+            "the agent named this request itself, and did not spend the clock"
+        );
+    }
+
+    /// Only the clock is waived. A replay loop is still a loop, and the
+    /// ceilings that count what it actually spent still bound it.
+    #[test]
+    fn an_agent_is_still_bound_by_what_it_spends() {
+        let budget = tight();
+        for at in 1..=3 {
+            assert!(
+                budget.claim_request(Spender::Agent).is_ok(),
+                "replay {at} is within 3"
+            );
+        }
+        let refused = budget
+            .claim_request(Spender::Agent)
+            .expect_err("the fourth is not");
+        assert!(refused.0.contains("made 4 requests"), "{refused}");
+
+        budget.reset();
+        assert!(budget.claim_request(Spender::Agent).is_ok());
+        budget.record(2000, 0, Duration::ZERO);
+        let refused = budget
+            .claim_request(Spender::Agent)
+            .expect_err("over the wire ceiling");
+        assert!(refused.0.contains("across the wire"), "{refused}");
+    }
+
+    /// A redirect a replay followed is still the agent's request: the chain is
+    /// classified by what asked for it, not by the hop it is on.
+    #[test]
+    fn a_spender_is_read_from_what_asked() {
+        use crate::receipt::Initiator;
+        assert_eq!(Spender::from(Initiator::Replay), Spender::Agent);
+        for page in [
+            Initiator::Navigation,
+            Initiator::Subresource,
+            Initiator::Frame,
+            Initiator::Redirect,
+        ] {
+            assert_eq!(Spender::from(page), Spender::Page, "{page:?}");
+        }
     }
 
     #[test]
     fn a_page_may_spend_up_to_its_allowance_and_not_past_it() {
         let budget = tight();
         for at in 1..=3 {
-            assert!(budget.claim_request().is_ok(), "request {at} is within 3");
+            assert!(budget.claim_request(Spender::Page).is_ok(), "request {at} is within 3");
         }
-        let refused = budget.claim_request().expect_err("the fourth is not");
+        let refused = budget.claim_request(Spender::Page).expect_err("the fourth is not");
         assert!(refused.0.contains("budget-exceeded"), "{refused}");
         // Both numbers: what was spent, and what the ceiling was.
         assert!(refused.0.contains("made 4 requests"), "{refused}");
         assert!(refused.0.contains("is 3"), "{refused}");
         // And it says what to do about it.
         assert!(refused.0.contains("Navigating"), "{refused}");
+    }
+
+    /// Navigating is the page's way back. Telling an agent to navigate is
+    /// telling it to throw away the page its walk is standing on, so the
+    /// refusal names the flag that does not.
+    ///
+    /// Every ceiling, because a refusal the caller cannot act on is the same
+    /// dead end whichever number it names.
+    #[test]
+    fn every_refusal_names_a_way_back_the_caller_can_take() {
+        for who in [Spender::Page, Spender::Agent] {
+            let way_back = start_again(who);
+            let says = |refused: Exceeded, names: &str| {
+                assert!(refused.0.contains(names), "{refused}");
+                assert!(refused.0.ends_with(way_back), "{who:?}: {refused}");
+            };
+
+            let budget = tight();
+            for _ in 0..3 {
+                let _ = budget.claim_request(who);
+            }
+            says(
+                budget.claim_request(who).expect_err("the fourth is over"),
+                "made 4 requests",
+            );
+
+            let budget = tight();
+            budget.record(2000, 0, Duration::ZERO);
+            says(
+                budget.claim_request(who).expect_err("over the wire ceiling"),
+                "across the wire",
+            );
+
+            let budget = tight();
+            budget.record(0, 3000, Duration::ZERO);
+            says(
+                budget.claim_request(who).expect_err("over the decoded ceiling"),
+                "decoded",
+            );
+
+            let budget = tight();
+            budget.record(0, 0, Duration::from_millis(200));
+            says(
+                budget.claim_request(who).expect_err("over the network clock"),
+                "waiting on the network",
+            );
+        }
     }
 
     /// A request that is *attempted* is spent, whatever its outcome. Counting
@@ -433,23 +598,23 @@ mod tests {
     fn a_failed_request_still_costs_its_place() {
         let budget = tight();
         for _ in 0..3 {
-            let _ = budget.claim_request();
+            let _ = budget.claim_request(Spender::Page);
             // No `record` call: the request never completed.
         }
-        assert!(budget.claim_request().is_err());
+        assert!(budget.claim_request(Spender::Page).is_err());
         assert_eq!(budget.spent().requests, 4);
     }
 
     #[test]
     fn the_byte_ceilings_are_cumulative_and_counted_separately() {
         let budget = tight();
-        assert!(budget.claim_request().is_ok());
+        assert!(budget.claim_request(Spender::Page).is_ok());
         // Under the wire ceiling, over nothing.
         budget.record(600, 1500, Duration::ZERO);
-        assert!(budget.claim_request().is_ok());
+        assert!(budget.claim_request(Spender::Page).is_ok());
         // Now past the wire ceiling.
         budget.record(600, 100, Duration::ZERO);
-        let refused = budget.claim_request().expect_err("over the wire ceiling");
+        let refused = budget.claim_request(Spender::Page).expect_err("over the wire ceiling");
         assert!(refused.0.contains("across the wire"), "{refused}");
     }
 
@@ -458,10 +623,10 @@ mod tests {
     #[test]
     fn the_decoded_ceiling_is_separate_from_the_wire_one() {
         let budget = tight();
-        assert!(budget.claim_request().is_ok());
+        assert!(budget.claim_request(Spender::Page).is_ok());
         // Tiny on the wire, enormous decoded: under one ceiling, over the other.
         budget.record(10, 5000, Duration::ZERO);
-        let refused = budget.claim_request().expect_err("over the decoded ceiling");
+        let refused = budget.claim_request(Spender::Page).expect_err("over the decoded ceiling");
         assert!(refused.0.contains("decoded"), "{refused}");
     }
 
@@ -470,11 +635,11 @@ mod tests {
     #[test]
     fn network_time_is_summed_across_requests() {
         let budget = tight();
-        assert!(budget.claim_request().is_ok());
+        assert!(budget.claim_request(Spender::Page).is_ok());
         budget.record(0, 0, Duration::from_millis(60));
-        assert!(budget.claim_request().is_ok(), "60ms is within 100ms");
+        assert!(budget.claim_request(Spender::Page).is_ok(), "60ms is within 100ms");
         budget.record(0, 0, Duration::from_millis(60));
-        let refused = budget.claim_request().expect_err("120ms is not");
+        let refused = budget.claim_request(Spender::Page).expect_err("120ms is not");
         assert!(refused.0.contains("waiting on the network"), "{refused}");
     }
 
@@ -485,19 +650,19 @@ mod tests {
     fn navigating_restores_the_allowance() {
         let budget = tight();
         for _ in 0..4 {
-            let _ = budget.claim_request();
+            let _ = budget.claim_request(Spender::Page);
         }
-        assert!(budget.claim_request().is_err());
+        assert!(budget.claim_request(Spender::Page).is_err());
 
         budget.reset();
-        assert!(budget.claim_request().is_ok());
+        assert!(budget.claim_request(Spender::Page).is_ok());
         assert_eq!(budget.spent().requests, 1);
     }
 
     #[test]
     fn spending_is_reported_so_a_reader_can_see_how_close_it_came() {
         let budget = tight();
-        let _ = budget.claim_request();
+        let _ = budget.claim_request(Spender::Page);
         budget.record(100, 200, Duration::from_millis(5));
         let spent = budget.spent();
         assert_eq!(spent.requests, 1);
